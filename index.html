@@ -201,9 +201,11 @@
     // ============================================================
     // JSONBIN CONFIG
     // ============================================================
-    const JSONBIN_ID  = "6a09fa45adc21f119ab4482a";
-    const JSONBIN_KEY = "$2a$10$aPp1nWEeN5ZeodnWHwhJIOvt0Kyc6W4A/8W3mOvLXxPd.TpPobkrm";
-    const JSONBIN_URL = `https://api.jsonbin.io/v3/b/${JSONBIN_ID}`;
+    const JSONBIN_KEY      = "$2a$10$aPp1nWEeN5ZeodnWHwhJIOvt0Kyc6W4A/8W3mOvLXxPd.TpPobkrm";
+    const JSONBIN_INDEX_ID = "6a09fa45adc21f119ab4482a"; // stores list of product bin IDs
+    const JSONBIN_BASE     = "https://api.jsonbin.io/v3/b";
+    const HEADERS_READ     = { "X-Master-Key": JSONBIN_KEY };
+    const HEADERS_WRITE    = { "X-Master-Key": JSONBIN_KEY, "Content-Type": "application/json" };
 
     // ---- Utility ----
     function showToast(msg, type = "default") {
@@ -218,9 +220,6 @@
       const n = parseFloat(v);
       return isNaN(n) ? v : (n % 1 === 0 ? `${n} EGP` : `${n.toFixed(2)} EGP`);
     }
-    function generateId() {
-      return Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
-    }
     function setStatus(msg, type) {
       const el = document.getElementById("firebase-status");
       el.textContent = msg;
@@ -228,39 +227,71 @@
     }
 
     // ---- JSONBin helpers ----
-    let _products = [];
+    let _products = [];   // full product objects (loaded from individual bins)
+    let _indexIds = [];   // list of { id, binId } stored in the index bin
 
+    // Read the index bin → get list of product bin IDs
+    async function loadIndex() {
+      const res = await fetch(`${JSONBIN_BASE}/${JSONBIN_INDEX_ID}/latest`, { headers: HEADERS_READ });
+      if (!res.ok) throw new Error("Index load failed: HTTP " + res.status);
+      const data = await res.json();
+      const raw  = data.record;
+      return Array.isArray(raw?.ids) ? raw.ids : [];
+    }
+
+    // Save the index bin (just the list of { id, binId })
+    async function saveIndex(ids) {
+      const res = await fetch(`${JSONBIN_BASE}/${JSONBIN_INDEX_ID}`, {
+        method: "PUT", headers: HEADERS_WRITE,
+        body: JSON.stringify({ ids })
+      });
+      if (!res.ok) throw new Error("Index save failed: HTTP " + res.status);
+    }
+
+    // Create a new bin for one product, return its binId
+    async function createProductBin(product) {
+      const res = await fetch(JSONBIN_BASE, {
+        method: "POST", headers: { ...HEADERS_WRITE, "X-Bin-Private": "false" },
+        body: JSON.stringify(product)
+      });
+      if (!res.ok) throw new Error("Create bin failed: HTTP " + res.status);
+      const data = await res.json();
+      return data.metadata.id;
+    }
+
+    // Delete a product's bin
+    async function deleteProductBin(binId) {
+      await fetch(`${JSONBIN_BASE}/${binId}`, { method: "DELETE", headers: HEADERS_READ });
+    }
+
+    // Load all products from their individual bins
     async function loadProducts() {
       setStatus("⏳ Loading products...", "loading");
       try {
-        const res = await fetch(JSONBIN_URL + "/latest", {
-          headers: { "X-Master-Key": JSONBIN_KEY }
-        });
-        if (!res.ok) throw new Error("HTTP " + res.status);
-        const data = await res.json();
-        const raw  = data.record;
-        _products  = Array.isArray(raw) ? raw
-                   : Array.isArray(raw?.products) ? raw.products
-                   : [];
-        setStatus("✅ Connected — products loaded", "connected");
-        renderProducts();
-        updateStats();
+        _indexIds = await loadIndex();
+        if (_indexIds.length === 0) {
+          _products = [];
+          setStatus("✅ Connected — no products yet", "connected");
+          renderProducts(); updateStats(); return;
+        }
+        // Fetch all product bins in parallel
+        const results = await Promise.allSettled(
+          _indexIds.map(entry =>
+            fetch(`${JSONBIN_BASE}/${entry.binId}/latest`, { headers: HEADERS_READ })
+              .then(r => r.json())
+              .then(d => ({ ...d.record, _binId: entry.binId }))
+          )
+        );
+        _products = results
+          .filter(r => r.status === "fulfilled")
+          .map(r => r.value)
+          .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+        setStatus(`✅ Connected — ${_products.length} product(s)`, "connected");
+        renderProducts(); updateStats();
       } catch (err) {
         setStatus("❌ Error: " + err.message, "error");
-        showToast("Failed to load products: " + err.message, "error");
+        showToast("Failed to load: " + err.message, "error");
       }
-    }
-
-    async function saveProducts() {
-      const res = await fetch(JSONBIN_URL, {
-        method:  "PUT",
-        headers: {
-          "Content-Type": "application/json",
-          "X-Master-Key":  JSONBIN_KEY
-        },
-        body: JSON.stringify({ products: _products })
-      });
-      if (!res.ok) throw new Error("Save failed: HTTP " + res.status);
     }
 
     // ---- Auth ----
@@ -295,27 +326,32 @@
       location.reload();
     });
 
-    // ---- Image Upload Preview ----
+    // ---- Image Upload & Compress ----
     let imageBase64 = null;
     const imgInput   = document.getElementById("p-image");
     const imgPreview = document.getElementById("img-preview");
 
-    // Compress image to max 800px and quality 0.7 before saving
-    function compressImage(file, maxSize, quality) {
-      return new Promise((resolve) => {
+    function compressImage(file) {
+      return new Promise(resolve => {
         const reader = new FileReader();
         reader.onload = ev => {
           const img = new Image();
           img.onload = () => {
             const canvas = document.createElement("canvas");
             let w = img.width, h = img.height;
-            if (w > maxSize || h > maxSize) {
-              if (w > h) { h = Math.round(h * maxSize / w); w = maxSize; }
-              else       { w = Math.round(w * maxSize / h); h = maxSize; }
-            }
+            const max = 600;
+            if (w > h) { h = Math.round(h * max / w); w = max; }
+            else       { w = Math.round(w * max / h); h = max; }
             canvas.width = w; canvas.height = h;
             canvas.getContext("2d").drawImage(img, 0, 0, w, h);
-            resolve(canvas.toDataURL("image/jpeg", quality));
+            let q = 0.7;
+            let result = canvas.toDataURL("image/jpeg", q);
+            // Keep reducing quality until under 60KB base64
+            while (result.length > 80000 && q > 0.2) {
+              q -= 0.1;
+              result = canvas.toDataURL("image/jpeg", q);
+            }
+            resolve(result);
           };
           img.src = ev.target.result;
         };
@@ -326,13 +362,7 @@
     imgInput.addEventListener("change", async e => {
       const file = e.target.files[0];
       if (!file) return;
-      if (file.size > 10 * 1024 * 1024) {
-        showToast("Image too large. Max 10MB.", "error");
-        imgInput.value = "";
-        return;
-      }
-      // Compress: max 800px, quality 0.72
-      imageBase64 = await compressImage(file, 800, 0.72);
+      imageBase64 = await compressImage(file);
       imgPreview.src = imageBase64;
       imgPreview.style.display = "block";
     });
@@ -344,125 +374,107 @@
       const category = document.getElementById("p-category").value.trim();
       const addBtn   = document.getElementById("add-product-btn");
 
-      if (!name)  { showToast("Product name is required.", "error"); return; }
-      if (!price) { showToast("Price is required.", "error"); return; }
-      if (isNaN(parseFloat(price)) || parseFloat(price) < 0) {
-        showToast("Enter a valid price.", "error"); return;
-      }
+      if (!name)        { showToast("Product name is required.", "error"); return; }
+      if (!price)       { showToast("Price is required.", "error"); return; }
+      if (isNaN(parseFloat(price)) || parseFloat(price) < 0) { showToast("Enter a valid price.", "error"); return; }
       if (!imageBase64) { showToast("Please upload a product image.", "error"); return; }
 
-      addBtn.disabled    = true;
-      addBtn.textContent = "Saving...";
-
+      addBtn.disabled = true; addBtn.textContent = "Saving...";
       const progressEl = document.getElementById("upload-progress");
       const fillEl     = document.getElementById("progress-fill");
       const textEl     = document.getElementById("progress-text");
       progressEl.style.display = "block";
-      fillEl.style.width = "40%";
-      textEl.textContent = "Saving product...";
+      fillEl.style.width = "30%"; textEl.textContent = "Creating product...";
 
       try {
         const product = {
-          id:        generateId(),
-          name,
-          price:     parseFloat(price),
-          category:  category || "",
-          image:     imageBase64,   // stored as base64 in JSONBin
-          createdAt: new Date().toISOString()
+          id: Date.now().toString(36) + Math.random().toString(36).slice(2,7),
+          name, price: parseFloat(price), category: category || "",
+          image: imageBase64, createdAt: new Date().toISOString()
         };
 
-        _products.unshift(product);   // newest first
-        fillEl.style.width = "70%";
+        fillEl.style.width = "60%"; textEl.textContent = "Uploading...";
 
-        await saveProducts();
+        // 1. Create a new bin for this product
+        const binId = await createProductBin(product);
 
-        fillEl.style.width = "100%";
-        textEl.textContent = "Done!";
+        fillEl.style.width = "80%"; textEl.textContent = "Saving index...";
+
+        // 2. Add to index
+        _indexIds.unshift({ id: product.id, binId });
+        await saveIndex(_indexIds);
+
+        fillEl.style.width = "100%"; textEl.textContent = "Done!";
+
+        // 3. Update local state
+        _products.unshift({ ...product, _binId: binId });
 
         // Reset form
-        document.getElementById("p-name").value     = "";
-        document.getElementById("p-price").value    = "";
+        document.getElementById("p-name").value = "";
+        document.getElementById("p-price").value = "";
         document.getElementById("p-category").value = "";
-        imgInput.value = "";
-        imgPreview.style.display = "none";
-        imgPreview.src = "";
-        imageBase64 = null;
+        imgInput.value = ""; imgPreview.style.display = "none";
+        imgPreview.src = ""; imageBase64 = null;
 
-        setTimeout(() => {
-          progressEl.style.display = "none";
-          fillEl.style.width = "0%";
-        }, 1000);
-
-        renderProducts();
-        updateStats();
-        showToast(`"${name}" added successfully!`, "success");
+        setTimeout(() => { progressEl.style.display = "none"; fillEl.style.width = "0%"; }, 1000);
+        renderProducts(); updateStats();
+        showToast(`"${name}" added!`, "success");
 
       } catch (err) {
-        showToast("Error saving: " + err.message, "error");
-        setStatus("❌ Save error — " + err.message, "error");
-        // rollback
-        _products.shift();
+        showToast("Error: " + err.message, "error");
+        setStatus("❌ " + err.message, "error");
+        _indexIds.shift();
       } finally {
-        addBtn.disabled    = false;
-        addBtn.textContent = "+ Add Product";
+        addBtn.disabled = false; addBtn.textContent = "+ Add Product";
       }
     });
 
     // ---- Delete Product ----
-    async function deleteProduct(id) {
-      if (!confirm("Delete this product? This cannot be undone.")) return;
+    async function deleteProduct(id, binId) {
+      if (!confirm("Delete this product?")) return;
       try {
+        await deleteProductBin(binId);
+        _indexIds = _indexIds.filter(e => e.id !== id);
+        await saveIndex(_indexIds);
         _products = _products.filter(p => p.id !== id);
-        await saveProducts();
-        renderProducts();
-        updateStats();
-        showToast("Product deleted.", "default");
+        renderProducts(); updateStats();
+        showToast("Deleted.", "default");
       } catch (err) {
-        showToast("Error deleting: " + err.message, "error");
-        await loadProducts(); // reload to restore correct state
+        showToast("Error: " + err.message, "error");
       }
     }
     window.deleteProduct = deleteProduct;
 
-    // ---- Render Products ----
+    // ---- Render ----
     function renderProducts() {
       const list    = document.getElementById("products-list");
       const countEl = document.getElementById("products-count");
       countEl.textContent = `${_products.length} product${_products.length !== 1 ? "s" : ""}`;
-
       if (_products.length === 0) {
-        list.innerHTML = `<div class="empty-products"><div class="icon">👕</div><p>No products yet. Add your first product!</p></div>`;
+        list.innerHTML = `<div class="empty-products"><div class="icon">👕</div><p>No products yet.</p></div>`;
         return;
       }
-
-      const fallback = `data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' width='60' height='75'><rect width='60' height='75' fill='%231a1a1a'/><text x='30' y='42' text-anchor='middle' fill='%23c9a84c' font-size='12' font-weight='bold'>SDN</text></svg>`;
-
+      const fb = `data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' width='60' height='75'><rect width='60' height='75' fill='%231a1a1a'/><text x='30' y='42' text-anchor='middle' fill='%23c9a84c' font-size='12' font-weight='bold'>SDN</text></svg>`;
       list.innerHTML = _products.map((p, i) => `
-        <div class="product-row" style="animation-delay:${i * 0.05}s">
-          <img class="product-thumb" src="${p.image || fallback}" alt="${p.name}"
-            onerror="this.src='${fallback}'" />
+        <div class="product-row" style="animation-delay:${i*0.05}s">
+          <img class="product-thumb" src="${p.image||fb}" alt="${p.name}" onerror="this.src='${fb}'" />
           <div class="product-row-info">
             <p class="product-row-name">${p.name}</p>
             <p class="product-row-price">${formatCurrency(p.price)}</p>
             ${p.category ? `<p class="product-row-cat">${p.category}</p>` : ""}
           </div>
-          <button class="btn-delete" onclick="deleteProduct('${p.id}')">Delete</button>
-        </div>
-      `).join("");
+          <button class="btn-delete" onclick="deleteProduct('${p.id}','${p._binId}')">Delete</button>
+        </div>`).join("");
     }
 
-    // ---- Stats ----
     function updateStats() {
       const cats = new Set(_products.map(p => p.category).filter(Boolean));
-      const avg  = _products.length
-        ? _products.reduce((s, p) => s + (parseFloat(p.price) || 0), 0) / _products.length : 0;
+      const avg  = _products.length ? _products.reduce((s,p) => s+(parseFloat(p.price)||0), 0) / _products.length : 0;
       document.getElementById("stat-total").textContent = _products.length;
       document.getElementById("stat-cats").textContent  = cats.size;
-      document.getElementById("stat-avg").textContent   = _products.length
-        ? Math.round(avg) + " EGP" : "—";
+      document.getElementById("stat-avg").textContent   = _products.length ? Math.round(avg)+" EGP" : "—";
     }
 
-    // ---- Show Dashboard ----
     function showDashboard() {
       loginScreen.style.display = "none";
       dashboard.style.display   = "block";
